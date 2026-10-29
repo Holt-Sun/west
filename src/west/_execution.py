@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -20,16 +21,28 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from typing import IO, TextIO
 
-from colorama.ansitowin32 import StreamWrapper
+from colorama.ansitowin32 import AnsiToWin32, StreamWrapper
 
 from west.util import PathType
 
 _current: ContextVar[ProjectContext | None] = ContextVar('west_project_execution', default=None)
+_INCOMPLETE_ANSI = re.compile(r'\x1b(?:\[[0-9;]*|\][^\x07]*)?\Z')
 
 
 if sys.platform == 'win32':
     import ctypes
     from ctypes import wintypes
+
+    class _ThreadEntry(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', wintypes.DWORD),
+            ('cntUsage', wintypes.DWORD),
+            ('th32ThreadID', wintypes.DWORD),
+            ('th32OwnerProcessID', wintypes.DWORD),
+            ('tpBasePri', wintypes.LONG),
+            ('tpDeltaPri', wintypes.LONG),
+            ('dwFlags', wintypes.DWORD),
+        ]
 
     class _WindowsJob:
         def __init__(self) -> None:
@@ -44,6 +57,18 @@ if sys.platform == 'win32':
             self._api.TerminateJobObject.restype = wintypes.BOOL
             self._api.CloseHandle.argtypes = [wintypes.HANDLE]
             self._api.CloseHandle.restype = wintypes.BOOL
+            self._api.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            self._api.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            self._api.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)]
+            self._api.Thread32First.restype = wintypes.BOOL
+            self._api.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)]
+            self._api.Thread32Next.restype = wintypes.BOOL
+            self._api.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            self._api.OpenThread.restype = wintypes.HANDLE
+            self._api.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+            self._api.GetProcessIdOfThread.restype = wintypes.DWORD
+            self._api.ResumeThread.argtypes = [wintypes.HANDLE]
+            self._api.ResumeThread.restype = wintypes.DWORD
             self._handle = self._api.CreateJobObjectW(None, None)
             if not self._handle:
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -61,8 +86,55 @@ if sys.platform == 'win32':
                     if process.poll() is None:
                         raise ctypes.WinError(error)
             finally:
-                if not self._api.CloseHandle(handle):
+                self._close_handle(handle)
+
+        def resume(self, process: subprocess.Popen[bytes]) -> None:
+            # Popen closes the primary thread handle; find its suspended thread.
+            snapshot = self._api.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+            if snapshot == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            threads = []
+            try:
+                entry = _ThreadEntry()
+                entry.dwSize = ctypes.sizeof(entry)
+                more = self._api.Thread32First(snapshot, ctypes.byref(entry))
+                while more:
+                    if entry.th32OwnerProcessID == process.pid:
+                        threads.append(entry.th32ThreadID)
+                    entry.dwSize = ctypes.sizeof(entry)
+                    more = self._api.Thread32Next(snapshot, ctypes.byref(entry))
+                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
                     raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                self._close_handle(snapshot)
+            if len(threads) != 1:
+                raise OSError(f'cannot identify the suspended Git thread for PID {process.pid}')
+            # THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME
+            thread = self._api.OpenThread(0x0802, False, threads[0])
+            if not thread:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                if self._api.GetProcessIdOfThread(thread) != process.pid:
+                    raise OSError(f'suspended Git thread ownership changed for PID {process.pid}')
+                if process.poll() is not None:
+                    raise OSError(
+                        f'suspended Git process exited before resuming: PID {process.pid}'
+                    )
+                count = self._api.ResumeThread(thread)
+                if count == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if count != 1:
+                    raise OSError(f'unexpected Git thread suspend count: {count}')
+            finally:
+                self._close_handle(thread)
+
+        def _close_handle(self, handle: int) -> None:
+            original = sys.exc_info()[1]
+            if not self._api.CloseHandle(handle):
+                error = ctypes.WinError(ctypes.get_last_error())
+                if original is not None:
+                    raise original from error
+                raise error
 
         def terminate(self) -> None:
             if not self._api.TerminateJobObject(self._handle, 1):
@@ -104,7 +176,8 @@ class ProcessController:
                     cwd=cwd,
                     stdout=stdout,
                     stderr=stderr,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    # CREATE_SUSPENDED prevents helpers escaping before job assignment.
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000004,
                 )
             else:
                 process = subprocess.Popen(
@@ -117,6 +190,7 @@ class ProcessController:
             self._children.add(process)
             if self._job is not None:
                 self._job.add(process)
+                self._job.resume(process)
             return process
 
     def finished(self, process: subprocess.Popen[bytes]) -> None:
@@ -214,9 +288,18 @@ class _ProjectOutput:
     def _copy(self, destination: TextIO, length: int, *, python: bool) -> None:
         if not length:
             return
-        binary = (
-            None if isinstance(destination, StreamWrapper) else getattr(destination, 'buffer', None)
-        )
+        binary = getattr(destination, 'buffer', None)
+        converter = None
+        if (
+            not python
+            and binary is not None
+            and isinstance(destination, StreamWrapper)
+            and sys.platform == 'win32'
+        ):
+            renderer = AnsiToWin32(destination, strip=False)
+            if renderer.convert:
+                converter = renderer
+                binary = None
         if python or binary is None:
             encoding = 'utf-8' if python else getattr(destination, 'encoding', None) or 'utf-8'
             decoder = codecs.getincrementaldecoder(encoding)(
@@ -224,13 +307,24 @@ class _ProjectOutput:
             )
         else:
             destination.flush()
+        pending = ''
         while length:
             data = self.file.read(min(length, 65536))
             if not data:
                 raise OSError('incomplete project output spool')
             length -= len(data)
             if python or binary is None:
-                destination.write(decoder.decode(data, final=not length))
+                text = pending + decoder.decode(data, final=not length)
+                pending = ''
+                if length and (isinstance(destination, StreamWrapper) or converter is not None):
+                    partial = _INCOMPLETE_ANSI.search(text)
+                    if partial is not None:
+                        pending = text[partial.start() :]
+                        text = text[: partial.start()]
+                if converter is not None:
+                    converter.write(text)
+                else:
+                    destination.write(text)
             elif binary.write(data) != len(data):
                 raise OSError('short write replaying project output')
 

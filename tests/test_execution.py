@@ -7,16 +7,19 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from colorama.ansitowin32 import AnsiToWin32
-from conftest import create_repo
+from conftest import cmd, create_repo
 
 from west.app.main import LogHandler
+from west.app.project import Update
 from west.commands import Verbosity, WestCommand
 from west.manifest import Project
 
@@ -84,6 +87,16 @@ def process_active(pid):
         except FileNotFoundError:
             return False
     return True
+
+
+def test_cli_helper_restores_manifest_logging(caplog):
+    logger = logging.getLogger('west.manifest')
+    level, handlers = logger.level, list(logger.handlers)
+    cmd(['-q', 'config', '--global', 'test.execution-isolation', 'true'])
+    assert logger.level == level
+    assert logger.handlers == handlers
+    logger.warning('manifest logging remains available to the next test')
+    assert 'manifest logging remains available to the next test' in caplog.text
 
 
 def test_buffered_producers_keep_stream_ownership(tmp_path, monkeypatch):
@@ -195,6 +208,37 @@ def test_colorama_text_only_replay_uses_original_rendering_policy(tmp_path, stri
         controller.close()
 
 
+@pytest.mark.parametrize('strip', [False, True])
+def test_colorama_binary_destination_retains_explicit_git_bytes(tmp_path, monkeypatch, strip):
+    from west import _execution
+
+    project = project_at(tmp_path / 'binary color')
+    argv = ['-c', 'color.ui=always', 'log', '-1', '--format=%CredGit color%Creset']
+    expected = project.git(argv, capture_stdout=True, capture_stderr=True).stdout
+    data = io.BytesIO()
+    text = io.TextIOWrapper(data, encoding='ascii', errors='backslashreplace')
+    wrapped = AnsiToWin32(text, convert=False, strip=strip).stream
+    controller = _execution.ProcessController()
+    scope = _execution.ProjectContext(
+        controller, buffered=True, stdout=wrapped, stderr=io.StringIO()
+    )
+    command = OutputCommand('output', 'output', 'output')
+    monkeypatch.setattr(OutputCommand, 'color_ui', property(lambda self: False))
+    try:
+        with scope.activate():
+            command.banner('West color disabled')
+            project.git(argv)
+        scope.replay()
+        text.flush()
+        assert b'\x1b[' in expected
+        assert data.getvalue().count(expected) == 1
+        assert b'\x1b[92m' not in data.getvalue()
+    finally:
+        controller.cancel()
+        scope.close()
+        controller.close()
+
+
 def test_unbuffered_context_has_no_spools_and_keeps_git_capture(tmp_path, monkeypatch, capfd):
     from west import _execution
 
@@ -230,6 +274,110 @@ def test_unbuffered_context_has_no_spools_and_keeps_git_capture(tmp_path, monkey
         controller.close()
 
 
+@pytest.mark.parametrize('failure', ['create', 'replay'])
+def test_output_io_failure_propagates_and_closes_owned_spools(tmp_path, monkeypatch, failure):
+    from west import _execution
+
+    command = Update()
+    command.args = SimpleNamespace(jobs=2, unbuffered=False)
+    command.updated = set()
+    command.auto_cache = command.name_cache = command.path_cache = None
+    command._topdir = os.fspath(tmp_path)
+    command._git_ver = (2, 40, 0)
+    projects = [Project(name, 'unused', topdir=tmp_path) for name in ['a', 'b', 'queued']]
+    files, starts = [], []
+    real_tempfile = tempfile.TemporaryFile
+
+    def temporary_file(*args, **kwargs):
+        if failure == 'create' and len(files) == 2:
+            raise OSError('injected output create failure')
+        file = real_tempfile(*args, **kwargs)
+        files.append(file)
+        return file
+
+    class Destination(io.StringIO):
+        def write(self, text):
+            if failure == 'replay' and 'work::' in text:
+                raise OSError('injected output replay failure')
+            return super().write(text)
+
+    def update(project):
+        starts.append(project.name)
+        command.inf(f'work::{project.name}')
+
+    monkeypatch.setattr(tempfile, 'TemporaryFile', temporary_file)
+    monkeypatch.setattr(command, 'update', update)
+    monkeypatch.setattr(sys, 'stdout', Destination())
+    original = sys.stdout, sys.stderr, Path.cwd(), dict(os.environ)
+    with pytest.raises(OSError, match=f'injected output {failure} failure'):
+        command._update_projects(projects)
+    assert files and all(file.closed for file in files)
+    assert 'queued' not in starts
+    assert _execution.current_context() is None
+    assert not any(t.name.startswith('west-update') for t in threading.enumerate())
+    assert (sys.stdout, sys.stderr, Path.cwd(), dict(os.environ)) == original
+
+
+def test_cleanup_reporting_preserves_primary_fatal_error(tmp_path, monkeypatch):
+    command = Update()
+    command.args = SimpleNamespace(jobs=2, unbuffered=False)
+    command.updated = set()
+    command.auto_cache = command.name_cache = command.path_cache = None
+    command._topdir = os.fspath(tmp_path)
+    command._git_ver = (2, 40, 0)
+    projects = [Project(name, 'unused', topdir=tmp_path) for name in ['a', 'b']]
+
+    class Output(io.StringIO):
+        def write(self, text):
+            if 'work::' in text:
+                raise OSError('injected cleanup replay failure')
+            return super().write(text)
+
+    class Error(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError('injected closed error stream')
+
+    def update(project):
+        command.inf(f'work::{project.name}')
+        raise SystemExit(7)
+
+    monkeypatch.setattr(command, 'update', update)
+    monkeypatch.setattr(sys, 'stdout', Output())
+    monkeypatch.setattr(sys, 'stderr', Error())
+    with pytest.raises(SystemExit) as raised:
+        command._update_projects(projects)
+    assert raised.value.code == 7
+    assert not command.updated
+    assert not any(t.name.startswith('west-update') for t in threading.enumerate())
+
+
+@pytest.mark.parametrize('producer', ['python', 'git'])
+def test_colorama_sequences_survive_replay_chunk_boundaries(tmp_path, producer):
+    from west import _execution
+
+    payload = 'x' * 65534 + '\x1b[31mred\x1b[0m\n'
+    out = io.StringIO()
+    wrapped = AnsiToWin32(out, convert=False, strip=True).stream
+    controller = _execution.ProcessController()
+    scope = _execution.ProjectContext(
+        controller, buffered=True, stdout=wrapped, stderr=io.StringIO()
+    )
+    try:
+        with scope.activate():
+            if producer == 'python':
+                OutputCommand('output', 'output', 'output').inf(payload, end='')
+            else:
+                project = project_at(tmp_path / 'ansi')
+                (Path(project.abspath) / 'ansi.txt').write_bytes(payload.encode('ascii'))
+                project.git(['-c', 'alias.emit=!cat ansi.txt', 'emit'])
+        scope.replay()
+        assert out.getvalue() == 'x' * 65534 + 'red\n'
+    finally:
+        controller.cancel()
+        scope.close()
+        controller.close()
+
+
 def test_scope_is_reset_after_fatal_error():
     from west import _execution
 
@@ -249,9 +397,14 @@ def test_scope_is_reset_after_fatal_error():
 
 
 @pytest.mark.parametrize('buffered', [False, True])
-def test_cancel_reaps_owned_git_tree_and_rejects_later_spawns(tmp_path, monkeypatch, buffered):
+@pytest.mark.parametrize('delay_registration', [False, True])
+def test_cancel_reaps_owned_git_tree_and_rejects_later_spawns(
+    tmp_path, monkeypatch, buffered, delay_registration
+):
     from west import _execution
 
+    if delay_registration and sys.platform != 'win32':
+        pytest.skip('Windows launch-to-job-assignment regression')
     project = project_at(tmp_path / 'children')
     pid_file = tmp_path / 'ready.pid'
     release = tmp_path / 'release'
@@ -275,6 +428,11 @@ def test_cancel_reaps_owned_git_tree_and_rejects_later_spawns(tmp_path, monkeypa
         process = popen(args, **kwargs)
         if args[0] == 'git':
             owned.append(process)
+            if delay_registration and not kwargs.get('creationflags', 0) & 0x4:
+                wait_until(
+                    lambda: pid_file.exists() and bool(pid_file.read_text(encoding='ascii')),
+                    timeout=30,
+                )
         return process
 
     monkeypatch.setattr(subprocess, 'Popen', record_popen)
