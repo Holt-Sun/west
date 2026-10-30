@@ -709,6 +709,7 @@ def test_cli_filesystem_aliases_match_serial(tmp_path, first, second, unbuffered
             ('bravo', second, second_revision),
         ]
     ]
+    manifest_paths_collide = Path(first) == Path(second)
     snapshots = []
     for jobs in (1, 2):
         root = tmp_path / f'jobs-{jobs}'
@@ -716,6 +717,13 @@ def test_cli_filesystem_aliases_match_serial(tmp_path, first, second, unbuffered
         workspace = _workspace(root, entries)
         errors = io.StringIO()
         options = ['--unbuffered'] if unbuffered else []
+        if manifest_paths_collide:
+            with pytest.raises(SystemExit) as raised:
+                cmd(['update', '-j', str(jobs), *options], cwd=workspace, stderr=errors)
+            assert raised.value.code == 1
+            assert f'project bravo path "{second}" is taken by project alpha' in errors.getvalue()
+            assert not any((workspace / entry['path']).exists() for entry in entries)
+            continue
         output = cmd(['update', '-j', str(jobs), *options], cwd=workspace, stderr=errors)
         if jobs == 2:
             assert 'overlapping project paths: alpha and bravo' in errors.getvalue()
@@ -729,7 +737,8 @@ def test_cli_filesystem_aliases_match_serial(tmp_path, first, second, unbuffered
                 for entry in entries
             ]
         )
-    assert snapshots[0] == snapshots[1] == [(second_revision, second_revision)] * 2
+    if not manifest_paths_collide:
+        assert snapshots[0] == snapshots[1] == [(second_revision, second_revision)] * 2
 
 
 @pytest.mark.parametrize('failure', ['failed', 'empty', 'unusable'])
