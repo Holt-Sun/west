@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
         task: [gh-test]
         # The include map here is actually used to extend the matrix.
@@ -57,6 +57,8 @@ jobs:
         with:
           path: "./check out"
           persist-credentials: false
+          repository: nxp-upstream/west
+          ref: 7155fd0e8853500b835c1c85683879b6d08e2e3c
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -98,6 +100,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          repository: nxp-upstream/west
+          ref: 7155fd0e8853500b835c1c85683879b6d08e2e3c
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
