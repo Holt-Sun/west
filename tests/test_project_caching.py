@@ -78,9 +78,23 @@ def cache_command(root, jobs=3):
     return command
 
 
-@pytest.mark.parametrize('state', ['empty', 'populated', 'alias', 'real-path-alias', 'name-cache'])
+@pytest.mark.parametrize(
+    'state',
+    [
+        'empty',
+        'populated',
+        'alias',
+        'real-path-alias',
+        'name-cache',
+        'missing-case-alias',
+        'missing-unicode-alias',
+    ],
+)
 def test_parallel_auto_cache_transaction_lock(tmp_path, monkeypatch, state, directory_alias):
     command = cache_command(tmp_path)
+    missing_alias = state in ('missing-case-alias', 'missing-unicode-alias')
+    if missing_alias:
+        command.auto_cache = os.fspath(tmp_path / 'Cache caf\u00e9')
     projects = [
         Project(name, url, path=f'projects/{name}', topdir=tmp_path)
         for name, url in [('a', 'shared'), ('b', 'shared'), ('c', 'independent')]
@@ -88,7 +102,7 @@ def test_parallel_auto_cache_transaction_lock(tmp_path, monkeypatch, state, dire
     real_auto_cache = command.project_auto_cache
     cache = Path(real_auto_cache(projects[0]))
     alias = None
-    if state != 'empty':
+    if state != 'empty' and not missing_alias:
         cache.mkdir(parents=True)
     if state == 'name-cache':
         command.name_cache = os.fspath(tmp_path / 'readonly')
@@ -99,6 +113,14 @@ def test_parallel_auto_cache_transaction_lock(tmp_path, monkeypatch, state, dire
         link = tmp_path / 'cache-alias'
         directory_alias(link, cache)
         alias = os.fspath(link)
+    elif missing_alias:
+        original = 'Cache caf\u00e9'
+        other = 'cache caf\u00e9' if state == 'missing-case-alias' else 'Cache cafe\u0301'
+        probe = tmp_path / 'cache-probe'
+        (probe / original).mkdir(parents=True)
+        if not (probe / other).exists() or not (probe / original).samefile(probe / other):
+            pytest.skip('filesystem does not alias these cache names')
+        alias = os.fspath(tmp_path / other / cache.relative_to(command.auto_cache))
 
     shared_entered, c_entered, attempted, release = [threading.Event() for _ in range(4)]
     first_thread = []

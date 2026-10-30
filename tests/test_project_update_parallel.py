@@ -606,6 +606,132 @@ def test_conflicting_projects_fall_back_serial(
     assert all(f'FALLBACK:{name}' in output.getvalue() for name in seen)
 
 
+@pytest.mark.parametrize('existing', [False, True], ids=['missing', 'existing'])
+@pytest.mark.parametrize(
+    'first, second',
+    [
+        ('Drivers', 'drivers'),
+        ('caf\u00e9', 'cafe\u0301'),
+        ('Modules', 'modules/driver'),
+        ('caf\u00e9', 'cafe\u0301/driver'),
+    ],
+    ids=['case', 'unicode', 'case-ancestor', 'unicode-ancestor'],
+)
+def test_filesystem_aliases_fall_back_serial(
+    tmp_path, monkeypatch, update_command, existing, first, second
+):
+    probe = tmp_path / 'probe'
+    (probe / first).mkdir(parents=True)
+    equivalent = probe / Path(second).parts[0]
+    if not equivalent.exists() or not (probe / first).samefile(equivalent):
+        pytest.skip('filesystem does not alias these names')
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    if existing:
+        (workspace / first).mkdir()
+    projects = [
+        Project(name, 'unused', path=path, topdir=workspace)
+        for name, path in [('alpha', first), ('bravo', second), ('charlie', 'independent')]
+    ]
+    owner = threading.get_ident()
+    seen = []
+    errors = io.StringIO()
+
+    def update(project):
+        assert threading.get_ident() == owner
+        seen.append(project.name)
+
+    monkeypatch.setattr(sys, 'stderr', errors)
+    monkeypatch.setattr(concurrent.futures, 'ThreadPoolExecutor', _no_executor)
+    monkeypatch.setattr(update_command, 'update', update)
+    assert update_command._update_projects(projects) == []
+    assert seen == ['alpha', 'bravo', 'charlie']
+    assert update_command.updated == set(seen)
+    assert 'overlapping project paths: alpha and bravo' in errors.getvalue()
+
+
+@pytest.mark.parametrize('case_sensitive', [False, True])
+def test_darwin_path_keys_respect_case_sensitivity(tmp_path, monkeypatch, case_sensitive):
+    def pathconf(path, option):
+        assert path == tmp_path
+        assert option == Update._DARWIN_PC_CASE_SENSITIVE
+        return int(case_sensitive)
+
+    monkeypatch.setattr(project_commands, 'sys', SimpleNamespace(platform='darwin'))
+    monkeypatch.setattr(os, 'pathconf', pathconf, raising=False)
+    upper = Update._path_key(tmp_path / 'Drivers')
+    lower = Update._path_key(tmp_path / 'drivers')
+    assert (upper == lower) is not case_sensitive
+    assert Update._path_key(tmp_path / 'caf\u00e9') == Update._path_key(tmp_path / 'cafe\u0301')
+
+
+@pytest.mark.parametrize('failure', ['unknown', 'error'])
+def test_darwin_path_probe_failure_aborts_batch(tmp_path, monkeypatch, update_command, failure):
+    def pathconf(path, option):
+        if failure == 'error':
+            raise PermissionError('path capability probe failed')
+        return -1
+
+    def unexpected_update(project):
+        pytest.fail('project updated before path capabilities were established')
+
+    errors = io.StringIO()
+    monkeypatch.setattr(project_commands, 'sys', SimpleNamespace(platform='darwin'))
+    monkeypatch.setattr(os, 'pathconf', pathconf, raising=False)
+    monkeypatch.setattr(sys, 'stderr', errors)
+    monkeypatch.setattr(concurrent.futures, 'ThreadPoolExecutor', _no_executor)
+    monkeypatch.setattr(update_command, 'update', unexpected_update)
+    with pytest.raises(SystemExit) as raised:
+        update_command._update_projects(_projects(tmp_path))
+    assert raised.value.code == 1
+    assert 'alpha: cannot inspect project path' in errors.getvalue()
+    assert not update_command.updated
+
+
+@pytest.mark.parametrize('unbuffered', [False, True], ids=['buffered', 'unbuffered'])
+@pytest.mark.parametrize(
+    'first, second', [('Drivers', 'drivers'), ('caf\u00e9', 'cafe\u0301')], ids=['case', 'unicode']
+)
+def test_cli_filesystem_aliases_match_serial(tmp_path, first, second, unbuffered):
+    probe = tmp_path / 'probe'
+    (probe / first).mkdir(parents=True)
+    if not (probe / second).exists() or not (probe / first).samefile(probe / second):
+        pytest.skip('filesystem does not alias these names')
+    remote = tmp_path / 'remote'
+    create_repo(remote)
+    first_revision = rev_parse(remote, 'HEAD')
+    add_commit(remote, 'second revision', files={'second.txt': 'second'})
+    second_revision = rev_parse(remote, 'HEAD')
+    entries = [
+        {'name': name, 'url': remote.as_uri(), 'path': path, 'revision': revision}
+        for name, path, revision in [
+            ('alpha', first, first_revision),
+            ('bravo', second, second_revision),
+        ]
+    ]
+    snapshots = []
+    for jobs in (1, 2):
+        root = tmp_path / f'jobs-{jobs}'
+        root.mkdir()
+        workspace = _workspace(root, entries)
+        errors = io.StringIO()
+        options = ['--unbuffered'] if unbuffered else []
+        output = cmd(['update', '-j', str(jobs), *options], cwd=workspace, stderr=errors)
+        if jobs == 2:
+            assert 'overlapping project paths: alpha and bravo' in errors.getvalue()
+        assert all(f'=== updating {entry["name"]} ' in output for entry in entries)
+        snapshots.append(
+            [
+                (
+                    rev_parse(workspace / entry['path'], 'HEAD'),
+                    rev_parse(workspace / entry['path'], 'refs/heads/manifest-rev'),
+                )
+                for entry in entries
+            ]
+        )
+    assert snapshots[0] == snapshots[1] == [(second_revision, second_revision)] * 2
+
+
 @pytest.mark.parametrize('failure', ['failed', 'empty', 'unusable'])
 def test_bad_common_dir_probe_aborts_batch(tmp_path, monkeypatch, failure):
     workspace = _workspace(tmp_path, _entries(tmp_path))

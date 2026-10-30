@@ -276,3 +276,53 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
                     injector.communicate(timeout=5)
             sentinel.terminate()
             sentinel.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS controlling-terminal regression')
+@pytest.mark.parametrize('buffered', [False, True])
+def test_cli_terminal_interrupt_cleans_owned_resources(tmp_path, monkeypatch, buffered):
+    import fcntl
+    import pty
+    import select
+    import termios
+
+    master, slave = pty.openpty()
+    real_popen = subprocess.Popen
+    interrupts = []
+
+    def claim_terminal():
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        os.tcsetpgrp(0, os.getpgrp())
+        assert os.tcgetpgrp(0) == os.getpgrp()
+
+    def terminal_popen(args, *popen_args, **kwargs):
+        driver = (
+            isinstance(args, list)
+            and len(args) > 1
+            and Path(args[1]).name == 'west interrupt driver.py'
+        )
+        if driver:
+            kwargs['stdin'] = slave
+            kwargs['preexec_fn'] = claim_terminal
+        process = real_popen(args, *popen_args, **kwargs)
+        if driver:
+            native_signal = process.send_signal
+
+            def send_signal(signum):
+                if signum == signal.SIGINT:
+                    interrupts.append(os.write(master, b'\x03'))
+                    if select.select([master], [], [], 1)[0]:
+                        os.read(master, 1024)
+                else:
+                    native_signal(signum)
+
+            process.send_signal = send_signal
+        return process
+
+    monkeypatch.setattr(subprocess, 'Popen', terminal_popen)
+    try:
+        test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buffered, 'direct')
+        assert interrupts == [1]
+    finally:
+        os.close(master)
+        os.close(slave)

@@ -17,6 +17,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 from _thread import LockType
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -1330,6 +1331,8 @@ class Status(_ProjectCommand):
 
 
 class Update(_ProjectCommand):
+    _DARWIN_PC_CASE_SENSITIVE: ClassVar[int] = 11
+
     def __init__(self):
         super().__init__(
             'update',
@@ -1583,6 +1586,29 @@ class Update(_ProjectCommand):
     def _normalized_path(path: PathType) -> Path:
         return Path(os.path.normcase(os.fspath(Path(path).resolve())))
 
+    @staticmethod
+    def _path_key(path: Path) -> tuple[int, int, tuple[str, ...]]:
+        ancestor = path
+        missing = []
+        while True:
+            try:
+                info = ancestor.stat()
+                break
+            except FileNotFoundError:
+                if ancestor.parent == ancestor:
+                    raise
+                missing.append(ancestor.name)
+                ancestor = ancestor.parent
+        if sys.platform == 'darwin' and missing:
+            case_sensitive = os.pathconf(ancestor, Update._DARWIN_PC_CASE_SENSITIVE)
+            if case_sensitive not in (0, 1):
+                raise OSError(f'cannot determine filename case sensitivity in {ancestor}')
+            missing = [
+                unicodedata.normalize('NFD', name if case_sensitive else name.casefold())
+                for name in missing
+            ]
+        return info.st_dev, info.st_ino, tuple(reversed(missing))
+
     def do_run(self, args, _):
         self.die_if_no_git()
         self.init_state(args)
@@ -1724,24 +1750,30 @@ class Update(_ProjectCommand):
         self._handle_failed(self.args, failed)
 
     def _parallel_conflict(self, projects: list[Project]) -> str | None:
-        paths: dict[Path, Project] = {}
+        paths: list[tuple[Path, Project]] = []
+        path_keys: dict[tuple[int, int, tuple[str, ...]], Project] = {}
         for project in projects:
             if project.abspath is None:
                 self.die(f'{project.name}: cannot inspect a project without a workspace path')
             try:
                 path = self._normalized_path(project.abspath)
+                key = self._path_key(path)
             except (OSError, ValueError, RuntimeError) as error:
                 self.die(f'{project.name}: cannot inspect project path {project.abspath}: {error}')
-            if path in paths:
-                return f'overlapping project paths: {paths[path].name} and {project.name}'
-            paths[path] = project
-        for path, project in paths.items():
-            for parent in path.parents:
-                if parent in paths:
-                    return f'overlapping project paths: {paths[parent].name} and {project.name}'
+            if key in path_keys:
+                return f'overlapping project paths: {path_keys[key].name} and {project.name}'
+            path_keys[key] = project
+            paths.append((path, project))
+        for path, project in paths:
+            try:
+                for parent in path.parents:
+                    if (ancestor := path_keys.get(self._path_key(parent))) is not None:
+                        return f'overlapping project paths: {ancestor.name} and {project.name}'
+            except (OSError, ValueError, RuntimeError) as error:
+                self.die(f'{project.name}: cannot inspect project path {path}: {error}')
 
         common_dirs: dict[tuple[int, int], Project] = {}
-        for path, project in paths.items():
+        for path, project in paths:
             try:
                 directory = path.stat()
             except FileNotFoundError:
@@ -1818,14 +1850,14 @@ class Update(_ProjectCommand):
         parallel = conflict is None
         if conflict:
             self.wrn(f'{conflict}; updating all selected ordinary projects serially.')
-        cache_keys: dict[str, Path] = {}
-        cache_locks: dict[Path, LockType] = {}
+        cache_keys: dict[str, tuple[int, int, tuple[str, ...]]] = {}
+        cache_locks: dict[tuple[int, int, tuple[str, ...]], LockType] = {}
         for project in selected:
             cache = self.project_auto_cache(project)
             if cache is not None:
                 try:
-                    key = self._normalized_path(cache)
-                except (OSError, RuntimeError) as error:
+                    key = self._path_key(self._normalized_path(cache))
+                except (OSError, ValueError, RuntimeError) as error:
                     self.die(f'{project.name}: cannot resolve auto-cache path {cache}: {error}')
                 cache_keys[project.name] = key
                 if key not in cache_locks:
