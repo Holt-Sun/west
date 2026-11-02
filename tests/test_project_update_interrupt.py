@@ -88,6 +88,7 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
     (workspace / 'mp' / 'west.yml').write_text(yaml.safe_dump(manifest), encoding='utf-8')
     for name in ['a', 'b', 'queued']:
         subprocess.check_call([GIT, 'clone', '--', remote, workspace / name])
+        (workspace / name / '.git' / 'unrelated.lock').write_bytes(b'not owned by West\n')
     ready = tmp_path / 'ready'
     ready.mkdir()
     release = tmp_path / 'release-cli'
@@ -100,8 +101,10 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
     driver.write_text(CLI_DRIVER, encoding='utf-8')
     helper = tmp_path / 'blocked upload-pack.py'
     helper.write_text(
-        'import os, sys, time\n'
+        'import os, signal, sys, time\n'
         'from pathlib import Path\n'
+        'if sys.platform != "win32":\n'
+        '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
         'ready, release = Path(sys.argv[1]), Path(sys.argv[2])\n'
         'ready.joinpath(str(os.getpid())).write_text(str(os.getpid()), encoding="ascii")\n'
         'while not release.exists():\n'
@@ -236,8 +239,13 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
             inject_trigger.touch()
         else:
             process.send_signal(signal.SIGINT)
-        process.communicate(timeout=max(0.1, 10 - (time.monotonic() - start)))
+        _, stderr = process.communicate(timeout=max(0.1, 10 - (time.monotonic() - start)))
         assert time.monotonic() - start < 10
+        assert b'forcefully stopped' in stderr
+        assert b'Git lock files may remain' in stderr
+        assert b'before removing' in stderr
+        for name in ['a', 'b']:
+            assert str(workspace / name).encode('utf-8') in stderr
         if sys.platform == 'win32':
             assert inject_sent.is_file()
             injector.communicate(timeout=3)
@@ -253,6 +261,10 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         assert all(not process_active(pid) for pid in fetches + helper_pids)
         assert len(list(ready.iterdir())) == 2
         assert sorted(starts.read_text(encoding='utf-8').splitlines()) == ['a', 'b']
+        for name in ['a', 'b', 'queued']:
+            assert (workspace / name / '.git' / 'unrelated.lock').read_bytes() == (
+                b'not owned by West\n'
+            )
         assert not list(spools.iterdir())
         assert sentinel.poll() is None
     finally:

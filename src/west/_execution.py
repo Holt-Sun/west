@@ -44,6 +44,18 @@ if sys.platform == 'win32':
             ('dwFlags', wintypes.DWORD),
         ]
 
+    class _JobAccounting(ctypes.Structure):
+        _fields_ = [
+            ('TotalUserTime', ctypes.c_longlong),
+            ('TotalKernelTime', ctypes.c_longlong),
+            ('ThisPeriodTotalUserTime', ctypes.c_longlong),
+            ('ThisPeriodTotalKernelTime', ctypes.c_longlong),
+            ('TotalPageFaultCount', wintypes.DWORD),
+            ('TotalProcesses', wintypes.DWORD),
+            ('ActiveProcesses', wintypes.DWORD),
+            ('TotalTerminatedProcesses', wintypes.DWORD),
+        ]
+
     class _WindowsJob:
         def __init__(self) -> None:
             self._api = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -55,6 +67,14 @@ if sys.platform == 'win32':
             self._api.AssignProcessToJobObject.restype = wintypes.BOOL
             self._api.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
             self._api.TerminateJobObject.restype = wintypes.BOOL
+            self._api.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.INT,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self._api.QueryInformationJobObject.restype = wintypes.BOOL
             self._api.CloseHandle.argtypes = [wintypes.HANDLE]
             self._api.CloseHandle.restype = wintypes.BOOL
             self._api.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -140,6 +160,21 @@ if sys.platform == 'win32':
             if not self._api.TerminateJobObject(self._handle, 1):
                 raise ctypes.WinError(ctypes.get_last_error())
 
+        def wait(self, timeout: float) -> None:
+            deadline = time.monotonic() + timeout
+            while True:
+                accounting = _JobAccounting()
+                if not self._api.QueryInformationJobObject(
+                    self._handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if not accounting.ActiveProcesses:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('owned Git job still contains running processes')
+                time.sleep(min(0.02, remaining))
+
         def close(self) -> None:
             if self._handle:
                 if not self._api.CloseHandle(self._handle):
@@ -152,6 +187,7 @@ class ProcessController:
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
         self._children: set[subprocess.Popen[bytes]] = set()
+        self.forced_termination = False
         if sys.platform == 'win32':
             self._job: _WindowsJob | None = _WindowsJob()
         else:
@@ -202,38 +238,71 @@ class ProcessController:
             self._cancelled.set()
             children = tuple(self._children)
         errors: list[Exception] = []
-        if sys.platform == 'win32':
-            assert self._job is not None
+
+        if sys.platform != 'win32':
+            groups = {process.pid for process in children}
+
+            def signal_groups(sig: int) -> bool:
+                active = False
+                for pid in tuple(groups):
+                    try:
+                        os.killpg(pid, sig)
+                        active = True
+                    except ProcessLookupError:
+                        groups.discard(pid)
+                    except OSError as error:
+                        errors.append(error)
+                        active = True
+                return active
+
+        # One shared grace lets Git finish lock transactions before forceful exit.
+        deadline = time.monotonic() + 2
+        if sys.platform != 'win32':
+            signal_groups(signal.SIGTERM)
+        for process in children:
             try:
-                self._job.terminate()
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
             except OSError as error:
                 errors.append(error)
+        if sys.platform == 'win32':
+            assert self._job is not None
+            force_job = False
+            try:
+                self._job.wait(max(0, deadline - time.monotonic()))
+            except TimeoutError:
+                force_job = True
+            except OSError as error:
+                errors.append(error)
+                force_job = True
+            if force_job:
+                self.forced_termination = True
+                try:
+                    self._job.terminate()
+                except OSError as error:
+                    errors.append(error)
             for process in children:
                 if process.poll() is None:
+                    self.forced_termination = True
                     try:
                         process.kill()
                     except OSError as error:
                         errors.append(error)
-        else:
-
-            def signal_groups(sig: int) -> None:
-                for process in children:
-                    try:
-                        os.killpg(process.pid, sig)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as error:
-                        errors.append(error)
-
-            signal_groups(signal.SIGTERM)
-            deadline = time.monotonic() + 0.25
-            for process in children:
+            if force_job:
                 try:
-                    process.wait(timeout=max(0, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    pass
-            # The group may outlive its leader, so always stop remaining members.
-            signal_groups(signal.SIGKILL)
+                    self._job.wait(2)
+                except OSError as error:
+                    errors.append(error)
+        else:
+            # Helpers may still be cleaning up after their group leader exits.
+            while signal_groups(0):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or errors:
+                    break
+                time.sleep(min(0.02, remaining))
+            if signal_groups(signal.SIGKILL):
+                self.forced_termination = True
         for process in children:
             try:
                 process.wait(timeout=2)

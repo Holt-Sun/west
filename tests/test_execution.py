@@ -519,6 +519,143 @@ def windows_job_api(monkeypatch):
     return api
 
 
+@pytest.mark.parametrize('buffered', [False, True])
+@pytest.mark.parametrize('cooperative', [False, True], ids=['blocked', 'finishes-in-grace'])
+def test_cancel_preserves_git_reference_lock_recovery(tmp_path, buffered, cooperative):
+    from west import _execution
+
+    if not cooperative and sys.platform != 'win32':
+        pytest.skip('Git can clean reference locks on POSIX SIGTERM')
+    project = project_at(tmp_path / 'transaction')
+    repo = Path(project.abspath)
+    hook = repo / '.git' / 'hooks' / 'reference-transaction'
+    hook.write_bytes(
+        b'#!/bin/sh\n'
+        b'if test "$1" = prepared; then\n'
+        b'  echo ready > transaction.ready\n'
+        b'  while test ! -f transaction.release; do sleep 0.02; done\n'
+        b'fi\n'
+    )
+    hook.chmod(0o755)
+    lock = repo / '.git' / 'refs' / 'heads' / 'cancel-probe.lock'
+    unrelated = repo / '.git' / 'unrelated.lock'
+    unrelated.write_bytes(b'not owned by West\n')
+    release = repo / 'transaction.release'
+    controller = _execution.ProcessController()
+    scope = _execution.ProjectContext(
+        controller, buffered=buffered, stdout=io.StringIO(), stderr=io.StringIO()
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    stop = threading.Event()
+
+    def transaction():
+        with scope.activate():
+            return project.git(
+                ['update-ref', 'refs/heads/cancel-probe', 'HEAD'],
+                capture_stdout=True,
+                capture_stderr=True,
+                check=False,
+            )
+
+    def release_during_grace():
+        if controller._cancelled.wait(10) and cooperative and not stop.wait(0.4):
+            release.touch()
+
+    releaser = threading.Thread(target=release_during_grace)
+    future = executor.submit(transaction)
+    releaser.start()
+    try:
+        wait_until(lambda: (repo / 'transaction.ready').exists() or future.done(), timeout=30)
+        assert not future.done(), 'Git must still hold the prepared transaction'
+        assert lock.is_file()
+        start = time.monotonic()
+        controller.cancel()
+        future.result(timeout=5)
+        assert time.monotonic() - start < 8
+        assert lock.exists() is (not cooperative)
+        assert unrelated.read_bytes() == b'not owned by West\n'
+        hook.unlink()
+        retry = project.git(
+            ['update-ref', 'refs/heads/cancel-probe', 'HEAD'],
+            capture_stdout=True,
+            capture_stderr=True,
+            check=False,
+        )
+        assert (retry.returncode == 0) is cooperative
+        if not cooperative:
+            assert b'cannot lock ref' in retry.stderr
+        assert controller.forced_termination is (not cooperative)
+    finally:
+        stop.set()
+        release.touch()
+        controller._cancelled.set()
+        releaser.join(timeout=5)
+        try:
+            controller.cancel()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            scope.close()
+            controller.close()
+        assert not releaser.is_alive()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows job includes outliving helpers')
+@pytest.mark.parametrize('cooperative', [False, True], ids=['blocked', 'finishes-in-grace'])
+def test_windows_cancel_waits_for_helper_after_git_exits(tmp_path, cooperative):
+    from west import _execution
+
+    project = project_at(tmp_path / 'helper-parent')
+    pid_file, release, completed = [tmp_path / name for name in ['pid', 'release', 'completed']]
+    helper = tmp_path / 'outliving helper.py'
+    helper.write_text(
+        'import os, subprocess, sys, time\n'
+        'from pathlib import Path\n'
+        'if len(sys.argv) == 1:\n'
+        '    subprocess.Popen([sys.executable, __file__, "child"])\n'
+        'else:\n'
+        f'    Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="ascii")\n'
+        f'    while not Path({str(release)!r}).exists():\n'
+        '        time.sleep(0.02)\n'
+        f'    Path({str(completed)!r}).touch()\n',
+        encoding='utf-8',
+    )
+    controller = _execution.ProcessController()
+    scope = _execution.ProjectContext(
+        controller, buffered=True, stdout=io.StringIO(), stderr=io.StringIO()
+    )
+    stop = threading.Event()
+
+    def release_during_grace():
+        if controller._cancelled.wait(10) and cooperative and not stop.wait(0.4):
+            release.touch()
+
+    releaser = threading.Thread(target=release_during_grace)
+    releaser.start()
+    try:
+        with scope.activate():
+            alias = '!' + shlex.join([sys.executable, os.fspath(helper)])
+            project.git(['-c', f'alias.spawn={alias}', 'spawn'])
+        wait_until(lambda: pid_file.exists() and bool(pid_file.read_text()), timeout=30)
+        helper_pid = int(pid_file.read_text())
+        assert process_active(helper_pid)
+        assert not controller._children
+        controller.cancel()
+        wait_until(lambda: not process_active(helper_pid), timeout=1)
+        assert completed.exists() is cooperative
+        assert controller.forced_termination is (not cooperative)
+    finally:
+        stop.set()
+        release.touch()
+        controller._cancelled.set()
+        releaser.join(timeout=5)
+        try:
+            controller.cancel()
+        finally:
+            scope.close()
+            controller.close()
+        assert not releaser.is_alive()
+
+
 def windows_call_failure(result=0):
     def failed(*args):
         ctypes.set_last_error(5)
@@ -637,7 +774,9 @@ def test_windows_job_resume_rejects_unsafe_state(windows_job_api, failure, diagn
         job.close()
 
 
-@pytest.mark.parametrize('failure', ['create', 'terminate', 'close', 'handle', 'handle-primary'])
+@pytest.mark.parametrize(
+    'failure', ['create', 'terminate', 'query', 'close', 'handle', 'handle-primary']
+)
 def test_windows_job_resource_failures_remain_visible(windows_job_api, failure):
     from west import _execution
 
@@ -666,6 +805,9 @@ def test_windows_job_resource_failures_remain_visible(windows_job_api, failure):
                 if failure == 'terminate':
                     api.TerminateJobObject.side_effect = windows_call_failure()
                     job.terminate()
+                elif failure == 'query':
+                    api.QueryInformationJobObject.side_effect = windows_call_failure()
+                    job.wait(0)
                 else:
                     api.CloseHandle.side_effect = windows_call_failure()
                     job.close() if failure == 'close' else job._close_handle(101)
@@ -676,35 +818,108 @@ def test_windows_job_resource_failures_remain_visible(windows_job_api, failure):
         job.close()
 
 
-@pytest.mark.parametrize('failure', ['job', 'kill', 'wait'])
+@pytest.mark.parametrize('active', [False, True])
+def test_windows_job_wait_includes_helpers_without_a_registered_leader(windows_job_api, active):
+    from west import _execution
+
+    api = windows_job_api
+
+    def query(handle, info_class, pointer, size, returned):
+        assert handle == 100 and info_class == 1 and returned is None
+        assert size == ctypes.sizeof(_execution._JobAccounting)
+        accounting = ctypes.cast(pointer, ctypes.POINTER(_execution._JobAccounting)).contents
+        accounting.ActiveProcesses = int(active)
+        return True
+
+    api.QueryInformationJobObject.side_effect = query
+    job = _execution._WindowsJob()
+    try:
+        if active:
+            with pytest.raises(TimeoutError, match='still contains running processes'):
+                job.wait(0)
+        else:
+            job.wait(0)
+        api.QueryInformationJobObject.assert_called_once()
+        api.TerminateJobObject.assert_not_called()
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize('failure', ['job', 'query', 'job-reap', 'kill', 'wait', 'grace-wait'])
 def test_windows_cancellation_reports_and_reaps_owned_children(windows_job_api, failure):
     from west import _execution
 
     api = windows_job_api
     controller = _execution.ProcessController()
+    job = controller._job
+    real_wait = job.wait
+    job.wait = Mock(side_effect=[TimeoutError('grace expired'), None])
     child = Mock(pid=42)
     child.poll.return_value = None
-    child.wait.return_value = 0
+    child.wait.side_effect = [subprocess.TimeoutExpired(['git'], 2), 0]
     controller._children.add(child)
     if failure == 'job':
         api.TerminateJobObject.side_effect = windows_call_failure()
+    elif failure == 'query':
+        job.wait.side_effect = [OSError('job query failed'), None]
+    elif failure == 'job-reap':
+        job.wait.side_effect = [TimeoutError('grace expired'), TimeoutError('job did not exit')]
     elif failure == 'kill':
         child.kill.side_effect = OSError('owned child kill failed')
+    elif failure == 'grace-wait':
+        child.wait.side_effect = [OSError('initial wait failed'), 0]
     else:
         child.wait.side_effect = subprocess.TimeoutExpired(['git'], 2)
     try:
         with pytest.raises(OSError, match='could not stop owned Git children'):
             controller.cancel()
+        assert controller.forced_termination
         child.kill.assert_called_once_with()
-        child.wait.assert_called_once_with(timeout=2)
+        assert child.wait.call_count == 2
+        assert 0 <= child.wait.call_args_list[0].kwargs['timeout'] <= 2
+        assert child.wait.call_args_list[1] == call(timeout=2)
+        assert 0 <= job.wait.call_args_list[0].args[0] <= 2
+        assert job.wait.call_args_list[1] == call(2)
         assert controller._children == ({child} if failure == 'wait' else set())
         with pytest.raises(CancelledError):
             controller.check()
     finally:
         api.TerminateJobObject.side_effect = None
+        job.wait = real_wait
         child.kill.side_effect = child.wait.side_effect = None
         controller.cancel()
         controller.close()
+
+
+def test_cancel_shares_grace_and_does_not_resignal_exited_groups(monkeypatch):
+    from west import _execution
+
+    signals = []
+
+    def killpg(pid, signum):
+        signals.append((pid, signum))
+        if signum != 15:
+            raise ProcessLookupError()
+
+    clock = iter([10, 10.5, 11.5])
+    monkeypatch.setattr(_execution, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(_execution, 'os', SimpleNamespace(killpg=killpg))
+    monkeypatch.setattr(_execution, 'signal', SimpleNamespace(SIGTERM=15, SIGKILL=9))
+    monkeypatch.setattr(
+        _execution, 'time', SimpleNamespace(monotonic=lambda: next(clock), sleep=Mock())
+    )
+    controller = _execution.ProcessController()
+    children = [Mock(pid=pid) for pid in [41, 42]]
+    controller._children.update(children)
+    controller.cancel()
+    assert sorted(child.wait.call_args_list[0].kwargs['timeout'] for child in children) == [
+        0.5,
+        1.5,
+    ]
+    assert sorted(signals) == [(41, 0), (41, 15), (42, 0), (42, 15)]
+    assert not controller.forced_termination
+    assert not controller._children
+    controller.close()
 
 
 @pytest.mark.parametrize('failure', ['signal', 'grace-timeout', 'reap'])
@@ -721,6 +936,10 @@ def test_posix_cancellation_escalation_and_errors(monkeypatch, failure):
     monkeypatch.setattr(_execution, 'sys', SimpleNamespace(platform='linux'))
     monkeypatch.setattr(_execution, 'os', SimpleNamespace(killpg=killpg))
     monkeypatch.setattr(_execution, 'signal', SimpleNamespace(SIGTERM=15, SIGKILL=9))
+    clock = iter(range(10))
+    monkeypatch.setattr(
+        _execution, 'time', SimpleNamespace(monotonic=lambda: next(clock), sleep=Mock())
+    )
     controller = _execution.ProcessController()
     child = Mock(pid=42)
     child.wait.return_value = 0
@@ -735,9 +954,10 @@ def test_posix_cancellation_escalation_and_errors(monkeypatch, failure):
         else:
             with pytest.raises(OSError, match='could not stop owned Git children'):
                 controller.cancel()
-        assert signals == [(42, 15), (42, 9)]
+        assert signals == [(42, 15), (42, 0), (42, 9)]
+        assert controller.forced_termination
         assert child.wait.call_count == 2
-        assert 0 <= child.wait.call_args_list[0].kwargs['timeout'] <= 0.25
+        assert 0 <= child.wait.call_args_list[0].kwargs['timeout'] <= 2
         assert child.wait.call_args_list[1] == call(timeout=2)
         assert controller._children == ({child} if failure == 'reap' else set())
         with pytest.raises(CancelledError):

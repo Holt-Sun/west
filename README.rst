@@ -86,6 +86,14 @@ default for these workflows. Interruption stops pending work and cleans up
 this invocation's owned Git children and output buffers; completed updates
 are not rolled back. Detached external helpers are not a process-lifecycle API.
 
+On cancellation, running commands share a two-second grace period before
+remaining owned processes are forcefully stopped. POSIX sends SIGTERM first;
+Windows allows current Git commands to finish naturally. Forceful termination
+can leave Git lock files, so West warns about potentially affected projects.
+If a later Git command reports a lock, check that no Git process is using the
+repository before manually removing a confirmed stale lock. West never removes
+Git lock files automatically.
+
 Before ordinary parallel work, West checks selected project paths and existing
 Git common directories. Overlapping paths or shared Git metadata produce a
 warning and serialize the entire ordinary list, preserving the requested output

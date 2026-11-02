@@ -12,6 +12,7 @@ import threading
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from conftest import GIT, add_commit, cmd, cmd_subprocess, create_repo, create_workspace, rev_parse
@@ -945,5 +946,57 @@ def test_cleanup_resource_errors_preserve_primary_failure(
         assert message in str(raised.value)
         assert update_command.updated == {'alpha', 'bravo'}
     assert message in capsys.readouterr().err
+    assert _current_context() is None
+    assert not any(thread.name.startswith('west-update') for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize('forced', [False, True])
+@pytest.mark.parametrize('warning_error', [None, BrokenPipeError, ValueError])
+@pytest.mark.parametrize('cancel_error', [False, True])
+def test_forced_git_stop_warns_without_replacing_primary_error(
+    tmp_path, monkeypatch, update_command, capsys, forced, warning_error, cancel_error
+):
+    from west import _execution
+
+    primary = RuntimeError('primary update failure')
+    original_cancel = _execution.ProcessController.cancel
+    warning = Mock(side_effect=warning_error('warning stream failed')) if warning_error else None
+
+    def cancel(controller):
+        original_cancel(controller)
+        controller.forced_termination = forced
+        if cancel_error:
+            raise OSError('injected stop failure')
+
+    def update(project):
+        update_command.err(f'{project.name}: partial Git output')
+        raise primary
+
+    monkeypatch.setattr(_execution.ProcessController, 'cancel', cancel)
+    monkeypatch.setattr(update_command, 'update', update)
+    if warning is not None:
+        monkeypatch.setattr(update_command, 'wrn', warning)
+    with pytest.raises(RuntimeError) as raised:
+        update_command._update_projects(_projects(tmp_path, ('alpha', 'bravo')))
+    assert raised.value is primary
+    errors = capsys.readouterr().err
+    assert 'partial Git output' in errors
+    if cancel_error:
+        assert isinstance(primary.__cause__, OSError)
+        assert 'injected stop failure' in str(primary.__cause__)
+        assert 'stopping owned Git children' in errors
+    if warning is not None:
+        assert warning.call_count == int(forced)
+        if forced:
+            assert isinstance(primary.__cause__, OSError)
+            assert 'warning stream failed' in str(primary.__cause__)
+    elif forced:
+        assert 'forcefully stopped' in errors
+        assert 'lock' in errors
+        assert 'alpha' in errors and str(tmp_path / 'alpha') in errors
+        assert 'bravo' in errors and str(tmp_path / 'bravo') in errors
+        assert 'before removing' in errors
+    else:
+        assert 'forcefully stopped' not in errors
     assert _current_context() is None
     assert not any(thread.name.startswith('west-update') for thread in threading.enumerate())

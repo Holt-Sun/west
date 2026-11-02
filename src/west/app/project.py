@@ -1970,6 +1970,20 @@ class Update(_ProjectCommand):
                 controller.close()
             except OSError as error:
                 cleanup_errors.append(('closing owned Git resources', error))
+            if controller.forced_termination:
+                affected = (
+                    ', '.join(f'{project.name} ({project.abspath})' for project, _ in open_scopes)
+                    or 'repositories updated by this invocation'
+                )
+                try:
+                    self.wrn(
+                        f'Git was forcefully stopped while updating {affected}. '
+                        'Git lock files may remain. If a later Git command reports a lock, '
+                        'check that no Git process is using that repository before removing '
+                        'a confirmed stale lock manually; West does not remove Git locks.'
+                    )
+                except (OSError, ValueError) as error:
+                    cleanup_errors.append(('reporting forced Git termination', error))
             reporting_errors = []
             for operation, cleanup_error in cleanup_errors:
                 try:
