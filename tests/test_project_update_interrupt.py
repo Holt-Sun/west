@@ -372,7 +372,7 @@ def test_cli_progress_on_pty(tmp_path, mode):
     exit_release = tmp_path / 'exit release'
     driver = tmp_path / 'progress driver.py'
     driver.write_text(
-        'import sys, time\n'
+        'import os, sys, time\n'
         'from pathlib import Path\n'
         'from west.app.main import main\n'
         'from west.app.project import Update\n'
@@ -387,8 +387,11 @@ def test_cli_progress_on_pty(tmp_path, mode):
         '    main(sys.argv[1:])\n'
         'finally:\n'
         f'    if {early_eof!r}:\n'
+        '        stdout_fd, stderr_fd = sys.stdout.fileno(), sys.stderr.fileno()\n'
         '        sys.stdout.close()\n'
         '        sys.stderr.close()\n'
+        '        os.close(stdout_fd)\n'
+        '        os.close(stderr_fd)\n'
         f'        while not Path({str(exit_release)!r}).exists():\n'
         '            time.sleep(0.02)\n',
         encoding='utf-8',
