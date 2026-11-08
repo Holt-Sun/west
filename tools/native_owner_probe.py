@@ -284,6 +284,7 @@ def anchor_case(behavior: str) -> dict[str, object]:
         guard = sentinel()
         process: subprocess.Popen[bytes] | None = None
         reaped = False
+        helpers_stopped = False
         try:
             process = subprocess.Popen(
                 command(directory, behavior),
@@ -328,12 +329,19 @@ def anchor_case(behavior: str) -> dict[str, object]:
             if forced:
                 os.killpg(process.pid, signal.SIGKILL)
             wait_no_live_members(process.pid, 5)
+            helpers_stopped = True
             after = members(process.pid)
             try:
                 os.killpg(process.pid, 0)
-                null_signal_exists = True
+                null_signal: dict[str, object] = {'outcome': 'EXISTS'}
             except ProcessLookupError:
-                null_signal_exists = False
+                null_signal = {'outcome': 'ABSENT'}
+            except PermissionError as error:
+                null_signal = {
+                    'outcome': 'PERMISSION_DENIED',
+                    'errno': error.errno,
+                    'error': str(error),
+                }
             waited, status = os.waitpid(process.pid, 0)
             process.returncode = os.waitstatus_to_exitcode(status)
             reaped = True
@@ -349,7 +357,7 @@ def anchor_case(behavior: str) -> dict[str, object]:
                 'term_received': (directory / 'term.json').exists(),
                 'forced': forced,
                 'grace_seconds': time.monotonic() - started,
-                'signal_zero_with_only_zombies': null_signal_exists,
+                'signal_zero_with_only_zombies': null_signal,
                 'leader_reaped': True,
                 'sentinel_alive': True,
                 'identity_retired_no_further_signals': True,
@@ -360,11 +368,14 @@ def anchor_case(behavior: str) -> dict[str, object]:
                 if process is not None and not reaped:
                     # No wait/poll reaped this owned leader: its ID remains reserved.
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    _, status = os.waitpid(process.pid, 0)
-                    process.returncode = os.waitstatus_to_exitcode(status)
+                        if not helpers_stopped:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    finally:
+                        _, status = os.waitpid(process.pid, 0)
+                        process.returncode = os.waitstatus_to_exitcode(status)
             finally:
                 stop_sentinel(guard)
 
@@ -376,10 +387,11 @@ def probe() -> None:
     os.environ['GIT_CONFIG_GLOBAL'] = os.devnull
     os.environ['GIT_CONFIG_NOSYSTEM'] = '1'
     os.environ['GIT_TERMINAL_PROMPT'] = '0'
-    parent = subprocess.check_output(['git', 'rev-parse', 'HEAD~1'], text=True, timeout=5).strip()
+    subprocess.run(['git', 'merge-base', '--is-ancestor', BASE, 'HEAD'], check=True, timeout=5)
+    subprocess.run(['git', 'diff', '--quiet', BASE, 'HEAD', '--', 'src'], check=True, timeout=5)
     expected = subprocess.check_output(['git', 'show', f'{BASE}:src/west/_execution.py'], timeout=5)
     actual = Path(execution.__file__).read_bytes()
-    if parent != BASE or actual != expected:
+    if actual != expected:
         raise RuntimeError('diagnostic did not import the exact unchanged control source')
     result: dict[str, object] = {
         'base': BASE,
