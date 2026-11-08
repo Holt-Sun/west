@@ -1,0 +1,43 @@
+---
+# yamllint disable rule:truthy
+name: Owner lifetime feasibility
+
+on:
+  push:
+    branches: ['ci/ZEP-7493-owner-feasibility-*']
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Check required source dependency
+        id: dependency
+        continue-on-error: true
+        run: python -c "import colorama.ansitowin32"
+      - name: Restore missing colorama dependency
+        if: steps.dependency.outcome == 'failure'
+        run: python -m pip install colorama==0.4.6
+      - name: Observe native ownership and waitid primitive
+        run: python tools/native_owner_probe.py
+      - name: Upload observations, including explicit incomplete results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: owner-feasibility-${{ matrix.os }}
+          path: native-owner-results.json
+          if-no-files-found: error
